@@ -1,99 +1,91 @@
 #!/usr/bin/env bash
+set -e
 
-# Copyright (c) 2021-2025 community-scripts ORG
-# Author: Slaviša Arežina (tremor021)
-# License: MIT | https://github.com/community-scripts/ProxmoxVE/raw/main/LICENSE
-# Source: https://github.com/outline/outline
+echo "==> Updating system..."
+apt-get update -y
+apt-get upgrade -y
+apt-get install -y curl wget gnupg ca-certificates build-essential git redis postgresql postgresql-contrib
 
-source /dev/stdin <<<"$FUNCTIONS_FILE_PATH"
-color
-verb_ip6
-catch_errors
-setting_up_container
-network_check
-update_os
+echo "==> Installing Node.js 20 and Yarn..."
+curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+apt-get install -y nodejs
+npm install -g yarn
 
-msg_info "Installing Dependencies"
-$STD apt-get install -y \
-  mkcert \
-  git \
-  redis
-msg_ok "Installed Dependencies"
-
-NODE_VERSION="20" NODE_MODULE="yarn@latest" setup_nodejs
-PG_VERSION="16" setup_postgresql
-
-msg_info "Set up PostgreSQL Database"
+echo "==> Creating Outline DB + User..."
 DB_NAME="outline"
 DB_USER="outline"
-DB_PASS="$(openssl rand -base64 18 | tr -dc 'a-zA-Z0-9' | cut -c1-13)"
-$STD sudo -u postgres psql -c "CREATE ROLE $DB_USER WITH LOGIN PASSWORD '$DB_PASS';"
-$STD sudo -u postgres psql -c "CREATE DATABASE $DB_NAME WITH OWNER $DB_USER ENCODING 'UTF8' TEMPLATE template0;"
-$STD sudo -u postgres psql -c "ALTER ROLE $DB_USER SET client_encoding TO 'utf8';"
-$STD sudo -u postgres psql -c "ALTER ROLE $DB_USER SET default_transaction_isolation TO 'read committed';"
-$STD sudo -u postgres psql -c "ALTER ROLE $DB_USER SET timezone TO 'UTC';"
-{
-  echo "Outline-Credentials"
-  echo "Outline Database User: $DB_USER"
-  echo "Outline Database Password: $DB_PASS"
-  echo "Outline Database Name: $DB_NAME"
-} >>~/outline.creds
-msg_ok "Set up PostgreSQL Database"
+DB_PASS="$(openssl rand -base64 18 | tr -dc 'a-zA-Z0-9!@#%&*' | cut -c1-16)"
 
-fetch_and_deploy_gh_release "outline" "outline/outline" "tarball"
+su - postgres -c "psql -c \"DROP DATABASE IF EXISTS $DB_NAME;\""
+su - postgres -c "psql -c \"DROP ROLE IF EXISTS $DB_USER;\""
+su - postgres -c "psql -c \"CREATE ROLE $DB_USER WITH LOGIN PASSWORD '$DB_PASS';\""
+su - postgres -c "psql -c \"CREATE DATABASE $DB_NAME WITH OWNER $DB_USER ENCODING 'UTF8' TEMPLATE template0;\""
+su - postgres -c "psql -c \"ALTER ROLE $DB_USER SET client_encoding TO 'utf8';\""
+su - postgres -c "psql -c \"ALTER ROLE $DB_USER SET default_transaction_isolation TO 'read committed';\""
+su - postgres -c "psql -c \"ALTER ROLE $DB_USER SET timezone TO 'UTC';\""
 
-msg_info "Configuring Outline (Patience)"
-SECRET_KEY="$(openssl rand -hex 32)"
-LOCAL_IP="$(hostname -I | awk '{print $1}')"
-cd /opt/outline
-cp .env.sample .env
+echo "Outline DB credentials:" > /root/outline.creds
+echo "DB_USER=$DB_USER" >> /root/outline.creds
+echo "DB_PASS=$DB_PASS" >> /root/outline.creds
+echo "DB_NAME=$DB_NAME" >> /root/outline.creds
 
-# Configure environment
-sed -i "s/generate_a_new_key/${SECRET_KEY}/g" /opt/outline/.env
-sed -i "s/user:pass@postgres/${DB_USER}:${DB_PASS}@localhost/g" /opt/outline/.env
-sed -i 's/redis:6379/localhost:6379/g' /opt/outline/.env
-sed -i "5s#URL=#URL=http://${LOCAL_IP}:3000#g" /opt/outline/.env
-sed -i 's/FORCE_HTTPS=true/FORCE_HTTPS=false/g' /opt/outline/.env
+echo "==> Cloning Outline..."
+cd /opt
+rm -rf outline
+git clone https://github.com/outline/outline.git
+cd outline
 
-export NODE_ENV=production
-export NODE_OPTIONS="--max-old-space-size=3584"
+echo "==> Creating .env..."
+SECRET_KEY=$(openssl rand -hex 32)
+UTILS_SECRET=$(openssl rand -hex 32)
+LOCAL_IP=$(hostname -I | awk '{print $1}')
 
-# Install deps & build
-$STD yarn install --frozen-lockfile
-$STD yarn build
+cat <<EOF > /opt/outline/.env
+# Base
+URL=http://$LOCAL_IP:3000
+PORT=3000
+SECRET_KEY=$SECRET_KEY
+UTILS_SECRET=$UTILS_SECRET
+FORCE_HTTPS=false
 
-# Copy frontend assets to public folder
-rm -rf public/static
-mkdir -p public/static
-cp -r build/app/assets public/static/assets
-cp build/app/manifest.webmanifest public/static/ || true
+# Database
+DATABASE_URL=postgres://$DB_USER:$DB_PASS@localhost:5432/$DB_NAME
 
-msg_ok "Configured Outline"
+# Redis
+REDIS_URL=redis://localhost:6379
 
-msg_info "Creating Service"
-cat <<EOF >/etc/systemd/system/outline.service
+# Storage
+FILE_STORAGE=local
+EOF
+
+echo "==> Installing dependencies & building..."
+yarn install --frozen-lockfile
+yarn build
+yarn db:migrate
+
+echo "==> Setting up systemd service..."
+cat <<EOF > /etc/systemd/system/outline.service
 [Unit]
-Description=Outline Service
-After=network.target
+Description=Outline Wiki
+After=network.target postgresql.service redis.service
 
 [Service]
 Type=simple
-User=root
 WorkingDirectory=/opt/outline
-ExecStart=/usr/bin/yarn start
+ExecStart=/usr/bin/yarn --cwd /opt/outline start
 Restart=always
 EnvironmentFile=/opt/outline/.env
+User=root
 
 [Install]
 WantedBy=multi-user.target
 EOF
-systemctl enable -q --now outline
-msg_ok "Created Service"
 
-motd_ssh
-customize
+systemctl daemon-reload
+systemctl enable --now outline
 
-msg_info "Cleaning up"
-$STD apt-get -y autoremove
-$STD apt-get -y autoclean
-msg_ok "Cleaned"
+echo "====================================================="
+echo " Outline installed successfully!"
+echo " Access it at: http://$LOCAL_IP:3000"
+echo " DB credentials saved in /root/outline.creds"
+echo "====================================================="
